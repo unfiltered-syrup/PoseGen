@@ -1,0 +1,15 @@
+# PoseGen dependencies
+# PyTorch for CUDA 12.9 — use the cu124 index (CUDA 12.x forward compat)
+# Install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Core CV / ML
+opencv-python>=4.10.0
+Pillow>=10.4.0
+numpy>=1.26.0
+scipy>=1.13.0
+
+# Networking / download helpers
+requests>=2.32.0
+tqdm>=4.66.0
