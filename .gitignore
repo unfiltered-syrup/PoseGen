@@ -1,3 +1,4 @@
 outputs/
 Universal-LPC-spritesheet/
 .venv/
+__pycache__
