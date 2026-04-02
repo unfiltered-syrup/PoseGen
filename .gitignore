@@ -2,3 +2,6 @@ outputs/
 Universal-LPC-spritesheet/
 .venv/
 __pycache__
+data_output/
+checkpoints/
+checkpoints_mse/
