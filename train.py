@@ -486,14 +486,14 @@ def generate_animation(model, frame_0_path: str, row_label: int, num_frames: int
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--data_dir', type=str, default='./data_output/frames')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--rows', type=int, nargs='+', default=None)
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=8,
                         help='DataLoader worker processes per loader')
     parser.add_argument('--grad_accum', type=int, default=1,
                         help='Gradient accumulation steps (simulate larger batch)')
@@ -585,6 +585,8 @@ def main():
                                          epoch_bar=epoch_bar)
         val_loss = eval_one_epoch(model, val_loader, device, perceptual_loss_fn=perceptual_loss_fn)
         scheduler.step()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         train_losses_G.append(loss_G)
         train_losses_D.append(loss_D)
