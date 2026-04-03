@@ -277,7 +277,7 @@ def compute_loss(pred, target, lengths, perceptual_loss_fn=None):
         return pred.sum() * 0.0
     pv, tv = pred_frames[valid], target_flat[valid]
     perc = perceptual_loss_fn(pv, tv) if perceptual_loss_fn is not None else torch.tensor(0.0, device=pred.device)
-    return 0.1 * F.l1_loss(pv, tv) + 1.0 * perc + 0.5 * ssim_loss(pv, tv)
+    return 0.1 * F.l1_loss(pv, tv) + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
 
 
 class PatchDiscriminator(nn.Module):
@@ -474,6 +474,7 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, default='./data_output/frames')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--dim_feedforward', type=int, default=2048)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--rows', type=int, nargs='+', default=None)
     parser.add_argument('--num_workers', type=int, default=8,
@@ -482,6 +483,8 @@ def parse_args():
                         help='Gradient accumulation steps (simulate larger batch)')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable automatic mixed precision (bf16/fp16)')
+    parser.add_argument('--min_lr', type=float, default=1e-6,
+                        help='Minimum learning rate for scheduler')
     return parser.parse_args()
 
 
@@ -510,11 +513,11 @@ def main():
                             collate_fn=collate_fn, num_workers=args.num_workers,
                             pin_memory=True, persistent_workers=args.num_workers > 0)
 
-    model = SpriteSeq2Seq(d_model=args.d_model).to(device)
+    model = SpriteSeq2Seq(d_model=args.d_model, dim_feedforward=args.dim_feedforward).to(device)
     tqdm.write(f'params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=max(1, args.epochs // 2), T_mult=1, eta_min=args.min_lr)
 
     perceptual_loss_fn = None
     if HAS_TORCHVISION_MODELS:
