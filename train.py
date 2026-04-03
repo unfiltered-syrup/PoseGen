@@ -159,29 +159,12 @@ class SpriteSeq2Seq(nn.Module):
 
     @torch.no_grad()
     def generate(self, frame0, row_label, num_frames):
-        device = frame0.device
-        enc_tokens = torch.cat([self.label_embed(row_label).unsqueeze(1),
-                                 self.encode_frame(frame0, 0)], dim=1)
-        memory = self.encoder(enc_tokens)
-        enc_proj = self.skip_proj(memory[:, 1:, :])
-        dec_input = self.bos_token.clone()
-        generated = []
-
-        for frame_idx in range(1, num_frames + 1):
-            for patch_idx in range(NUM_PATCHES):
-                tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-                    dec_input.size(1), device=device)
-                dec_out = self.decoder(dec_input, memory, tgt_mask=tgt_mask)
-                skip_tok = enc_proj[:, patch_idx % NUM_PATCHES, :].unsqueeze(1)
-                pred_patch = torch.sigmoid(self.out_proj(dec_out[:, -1:, :] + skip_tok))
-                generated.append(pred_patch.squeeze(1))
-                next_tok = self.patch_proj(pred_patch)
-                next_tok = next_tok + self.spatial_pos(device)[patch_idx].unsqueeze(0).unsqueeze(0)
-                next_tok = next_tok + self.temporal_pos(frame_idx).unsqueeze(0).unsqueeze(0)
-                dec_input = torch.cat([dec_input, next_tok], dim=1)
-
-        patches = torch.stack(generated, dim=1).view(1, num_frames, NUM_PATCHES, PATCH_DIM)
-        return torch.stack([patches_to_frame(patches[0, i]) for i in range(num_frames)])
+        dummy_targets = frame0.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
+        pred = self.forward_train(frame0, dummy_targets, row_label)
+        B, T_patches, D = pred.shape
+        T = T_patches // NUM_PATCHES
+        patches = pred.view(B, T, NUM_PATCHES, PATCH_DIM)
+        return torch.stack([patches_to_frame(patches[0, i]) for i in range(T)])
 
 
 class SpriteAnimDataset(Dataset):
