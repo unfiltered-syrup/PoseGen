@@ -8,9 +8,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler
 from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from einops import rearrange
+from tqdm import tqdm
 
 try:
     import torchvision.models as tvm
@@ -317,22 +319,29 @@ ADV_LOSS_WEIGHT = 0.001
 
 def train_one_epoch(model, loader, optimizer, device,
                     discriminator=None, optimizer_D=None,
-                    perceptual_loss_fn=None, epoch: int = 0):
+                    perceptual_loss_fn=None, epoch: int = 0,
+                    scaler: GradScaler = None, grad_accum: int = 1,
+                    epoch_bar: tqdm = None):
     model.train()
     if discriminator is not None:
         discriminator.train()
     total_G = total_D = 0.0
     bce = nn.BCEWithLogitsLoss()
     gan_active = discriminator is not None and optimizer_D is not None and epoch >= GAN_WARMUP_EPOCHS
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_amp = scaler is not None
 
-    for frame0, target, row_labels, lengths in loader:
-        frame0, target = frame0.to(device), target.to(device)
-        row_labels, lengths = row_labels.to(device), lengths.to(device)
+    optimizer.zero_grad()
+    batch_bar = tqdm(loader, desc=f'  batches', leave=False, unit='bat', dynamic_ncols=True)
+    for step, (frame0, target, row_labels, lengths) in enumerate(batch_bar):
+        frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
+        row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
         B, T, C, H, W = target.shape
 
-        pred = model.forward_train(frame0, target, row_labels)
-        pred_frames = patches_to_frame(pred.view(B * T, NUM_PATCHES, PATCH_DIM))
-        target_flat = target.view(B * T, C, H, W)
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            pred = model.forward_train(frame0, target, row_labels)
+            pred_frames = patches_to_frame(pred.view(B * T, NUM_PATCHES, PATCH_DIM))
+            target_flat = target.view(B * T, C, H, W)
 
         mask = torch.zeros(B, T, device=device)
         for i, l in enumerate(lengths):
@@ -341,30 +350,56 @@ def train_one_epoch(model, loader, optimizer, device,
 
         if gan_active:
             real = target_flat[valid]
-            fake = pred_frames[valid].detach()
-            r_pred = discriminator(real + torch.randn_like(real) * D_NOISE_STD)
-            f_pred = discriminator(fake + torch.randn_like(fake) * D_NOISE_STD)
-            loss_D = 0.5 * (bce(r_pred, torch.full_like(r_pred, D_REAL_LABEL)) +
-                            bce(f_pred, torch.zeros_like(f_pred)))
+            fake = pred_frames[valid].detach().float()
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                r_pred = discriminator(real + torch.randn_like(real) * D_NOISE_STD)
+                f_pred = discriminator(fake + torch.randn_like(fake) * D_NOISE_STD)
+                loss_D = 0.5 * (bce(r_pred, torch.full_like(r_pred, D_REAL_LABEL)) +
+                                bce(f_pred, torch.zeros_like(f_pred)))
             optimizer_D.zero_grad()
-            loss_D.backward()
-            nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
-            optimizer_D.step()
+            if use_amp:
+                scaler.scale(loss_D).backward()
+                scaler.unscale_(optimizer_D)
+                nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+                scaler.step(optimizer_D)
+                scaler.update()
+            else:
+                loss_D.backward()
+                nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+                optimizer_D.step()
             total_D += loss_D.item()
 
-        recon = compute_loss(pred, target, lengths, perceptual_loss_fn)
-        if gan_active:
-            adv_out = discriminator(pred_frames[valid])
-            loss_G = recon + ADV_LOSS_WEIGHT * bce(adv_out, torch.ones_like(adv_out))
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            recon = compute_loss(pred, target, lengths, perceptual_loss_fn)
+            if gan_active:
+                adv_out = discriminator(pred_frames[valid])
+                loss_G = (recon + ADV_LOSS_WEIGHT * bce(adv_out, torch.ones_like(adv_out))) / grad_accum
+            else:
+                loss_G = recon / grad_accum
+
+        if use_amp:
+            scaler.scale(loss_G).backward()
         else:
-            loss_G = recon
+            loss_G.backward()
 
-        optimizer.zero_grad()
-        loss_G.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total_G += loss_G.item()
+        is_last_step = (step + 1) == len(loader)
+        if (step + 1) % grad_accum == 0 or is_last_step:
+            if use_amp:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            optimizer.zero_grad()
 
+        total_G += loss_G.item() * grad_accum
+        running_G = total_G / (step + 1)
+        running_D = total_D / (step + 1) if gan_active else 0.0
+        batch_bar.set_postfix(G=f'{running_G:.4f}', D=f'{running_D:.4f}')
+
+    batch_bar.close()
     n = len(loader)
     return total_G / n, total_D / n
 
@@ -373,16 +408,21 @@ def train_one_epoch(model, loader, optimizer, device,
 def eval_one_epoch(model, loader, device, perceptual_loss_fn=None):
     model.eval()
     total = 0.0
-    for frame0, target, row_labels, lengths in loader:
-        frame0, target = frame0.to(device), target.to(device)
-        row_labels, lengths = row_labels.to(device), lengths.to(device)
+    val_bar = tqdm(loader, desc='  val', leave=False, unit='bat', dynamic_ncols=True)
+    for frame0, target, row_labels, lengths in val_bar:
+        frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
+        row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
         pred = model.forward_train(frame0, target, row_labels)
-        total += compute_loss(pred, target, lengths, perceptual_loss_fn).item()
+        loss = compute_loss(pred, target, lengths, perceptual_loss_fn).item()
+        total += loss
+        val_bar.set_postfix(loss=f'{loss:.4f}')
+    val_bar.close()
     return total / len(loader)
 
 
 def save_checkpoint(model, optimizer, epoch, path,
-                    discriminator=None, optimizer_D=None, curriculum_max_frames=None):
+                    discriminator=None, optimizer_D=None, curriculum_max_frames=None,
+                    train_losses_G=None, train_losses_D=None, val_losses=None):
     ckpt = {'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict()}
     if discriminator is not None:
         ckpt['discriminator_state'] = discriminator.state_dict()
@@ -390,7 +430,42 @@ def save_checkpoint(model, optimizer, epoch, path,
         ckpt['optimizer_D_state'] = optimizer_D.state_dict()
     if curriculum_max_frames is not None:
         ckpt['curriculum_max_frames'] = curriculum_max_frames
+    if train_losses_G is not None:
+        ckpt['train_losses_G'] = train_losses_G
+    if train_losses_D is not None:
+        ckpt['train_losses_D'] = train_losses_D
+    if val_losses is not None:
+        ckpt['val_losses'] = val_losses
     torch.save(ckpt, path)
+
+
+def plot_losses(train_losses_G, train_losses_D, val_losses, plot_dir):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    os.makedirs(plot_dir, exist_ok=True)
+    epochs = range(1, len(train_losses_G) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    axes[0].plot(epochs, train_losses_G, label='train G')
+    axes[0].plot(epochs, val_losses, label='val')
+    axes[0].set_xlabel('epoch')
+    axes[0].set_ylabel('loss')
+    axes[0].set_title('Generator Loss')
+    axes[0].legend()
+
+    axes[1].plot(epochs, train_losses_D, label='train D', color='tab:orange')
+    axes[1].set_xlabel('epoch')
+    axes[1].set_ylabel('loss')
+    axes[1].set_title('Discriminator Loss')
+    axes[1].legend()
+
+    fig.suptitle('PoseGen Training')
+    fig.tight_layout()
+    path = os.path.join(plot_dir, 'loss_curve.png')
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    tqdm.write(f'loss curve → {path}')
 
 
 def generate_animation(model, frame_0_path: str, row_label: int, num_frames: int, output_path: str):
@@ -418,19 +493,30 @@ def parse_args():
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--rows', type=int, nargs='+', default=None)
+    parser.add_argument('--num_workers', type=int, default=16,
+                        help='DataLoader worker processes per loader')
+    parser.add_argument('--grad_accum', type=int, default=1,
+                        help='Gradient accumulation steps (simulate larger batch)')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable automatic mixed precision (bf16/fp16)')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'device: {device}')
+    tqdm.write(f'device: {device}')
+
+    use_amp = not args.no_amp and device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    tqdm.write(f'AMP: {use_amp} ({amp_dtype}), grad_accum: {args.grad_accum}, num_workers: {args.num_workers}')
 
     dataset = SpriteAnimDataset(args.data_dir)
     if args.rows is not None:
         row_set = set(args.rows)
         dataset.samples = [s for s in dataset.samples if s[1] in row_set]
-    print(f'samples: {len(dataset)}')
+    tqdm.write(f'samples: {len(dataset)}')
 
     val_size = max(1, int(0.2 * len(dataset)))
     train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size],
@@ -438,10 +524,11 @@ def main():
     dataset_max_frames = max(s[2] - 1 for s in dataset.samples)
 
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=16)
+                            collate_fn=collate_fn, num_workers=args.num_workers,
+                            pin_memory=True, persistent_workers=args.num_workers > 0)
 
     model = SpriteSeq2Seq(d_model=args.d_model).to(device)
-    print(f'params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
+    tqdm.write(f'params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -460,6 +547,7 @@ def main():
     start_epoch = 0
     best_val_loss = float('inf')
     resume_curriculum_min = 2
+    train_losses_G, train_losses_D, val_losses = [], [], []
 
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
@@ -472,37 +560,56 @@ def main():
         if opt_d_state:
             optimizer_D.load_state_dict(opt_d_state)
         resume_curriculum_min = ckpt.get('curriculum_max_frames', 2)
+        train_losses_G = ckpt.get('train_losses_G', [])
+        train_losses_D = ckpt.get('train_losses_D', [])
+        val_losses = ckpt.get('val_losses', [])
         start_epoch = ckpt['epoch'] + 1
-        print(f'resumed epoch {ckpt["epoch"]}')
+        tqdm.write(f'resumed epoch {ckpt["epoch"]}')
 
-    for epoch in range(start_epoch, args.epochs):
+    epoch_bar = tqdm(range(start_epoch, args.epochs), desc='epochs', unit='ep', dynamic_ncols=True)
+    for epoch in epoch_bar:
         curr_max = max(resume_curriculum_min,
                        get_curriculum_max_frames(epoch, args.epochs, max_frames=dataset_max_frames))
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=partial(collate_fn, max_frames=curr_max), num_workers=0)
+                                  collate_fn=partial(collate_fn, max_frames=curr_max),
+                                  num_workers=args.num_workers, pin_memory=True,
+                                  persistent_workers=args.num_workers > 0)
 
         loss_G, loss_D = train_one_epoch(model, train_loader, optimizer, device,
                                          discriminator=discriminator, optimizer_D=optimizer_D,
-                                         perceptual_loss_fn=perceptual_loss_fn, epoch=epoch)
+                                         perceptual_loss_fn=perceptual_loss_fn, epoch=epoch,
+                                         scaler=scaler, grad_accum=args.grad_accum,
+                                         epoch_bar=epoch_bar)
         val_loss = eval_one_epoch(model, val_loader, device, perceptual_loss_fn=perceptual_loss_fn)
         scheduler.step()
 
-        print(f'epoch {epoch+1:3d}/{args.epochs}  G={loss_G:.5f}  D={loss_D:.5f}  val={val_loss:.5f}  cur={curr_max}')
+        train_losses_G.append(loss_G)
+        train_losses_D.append(loss_D)
+        val_losses.append(val_loss)
+
+        epoch_bar.set_postfix(G=f'{loss_G:.4f}', D=f'{loss_D:.4f}', val=f'{val_loss:.4f}', cur=curr_max)
+        tqdm.write(f'epoch {epoch+1:3d}/{args.epochs}  G={loss_G:.5f}  D={loss_D:.5f}  val={val_loss:.5f}  cur={curr_max}')
 
         if (epoch + 1) % 10 == 0:
             save_checkpoint(model, optimizer, epoch,
                             os.path.join(args.checkpoint_dir, f'epoch_{epoch+1}.pt'),
                             discriminator=discriminator, optimizer_D=optimizer_D,
-                            curriculum_max_frames=curr_max)
+                            curriculum_max_frames=curr_max,
+                            train_losses_G=train_losses_G, train_losses_D=train_losses_D,
+                            val_losses=val_losses)
+            plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(model, optimizer, epoch,
                             os.path.join(args.checkpoint_dir, 'best_model.pt'),
                             discriminator=discriminator, optimizer_D=optimizer_D,
-                            curriculum_max_frames=curr_max)
+                            curriculum_max_frames=curr_max,
+                            train_losses_G=train_losses_G, train_losses_D=train_losses_D,
+                            val_losses=val_losses)
 
-    print(f'done. best val={best_val_loss:.5f}')
+    plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
+    tqdm.write(f'done. best val={best_val_loss:.5f}')
 
 
 if __name__ == '__main__':
