@@ -411,7 +411,7 @@ def generate_animation(model, frame_0_path: str, row_label: int, num_frames: int
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=48)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--data_dir', type=str, default='./data_output/frames')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
@@ -438,7 +438,7 @@ def main():
     dataset_max_frames = max(s[2] - 1 for s in dataset.samples)
 
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=0)
+                            collate_fn=collate_fn, num_workers=16)
 
     model = SpriteSeq2Seq(d_model=args.d_model).to(device)
     print(f'params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
