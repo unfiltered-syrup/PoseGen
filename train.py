@@ -566,14 +566,17 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         tqdm.write(f'resumed epoch {ckpt["epoch"]}')
 
+    train_loader = None
     epoch_bar = tqdm(range(start_epoch, args.epochs), desc='epochs', unit='ep', dynamic_ncols=True)
     for epoch in epoch_bar:
         curr_max = max(resume_curriculum_min,
                        get_curriculum_max_frames(epoch, args.epochs, max_frames=dataset_max_frames))
+        if train_loader is not None:
+            del train_loader
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=partial(collate_fn, max_frames=curr_max),
                                   num_workers=args.num_workers, pin_memory=True,
-                                  persistent_workers=args.num_workers > 0)
+                                  persistent_workers=False)
 
         loss_G, loss_D = train_one_epoch(model, train_loader, optimizer, device,
                                          discriminator=discriminator, optimizer_D=optimizer_D,
