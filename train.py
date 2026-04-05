@@ -1,4 +1,5 @@
 import argparse
+import torch.utils.checkpoint
 import math
 import os
 import re
@@ -75,13 +76,13 @@ class TemporalPosEncoding(nn.Module):
 class SpriteSeq2Seq(nn.Module):
     def __init__(
         self,
-        d_model: int = 256,
-        nhead: int = 8,
-        num_encoder_layers: int = 6,
-        num_decoder_layers: int = 6,
-        dim_feedforward: int = 1024,
+        d_model: int = 768,
+        nhead: int = 16,
+        num_encoder_layers: int = 12,
+        num_decoder_layers: int = 12,
+        dim_feedforward: int = 4096,
         dropout: float = 0.1,
-        max_frames: int = 64,
+        max_frames: int = 24,
         num_row_labels: int = 21,
     ):
         super().__init__()
@@ -132,7 +133,7 @@ class SpriteSeq2Seq(nn.Module):
         B, T = frame0.size(0), target_frames.size(1)
         enc_tokens = torch.cat([self.label_embed(row_labels).unsqueeze(1),
                                  self.encode_frame(frame0, 0)], dim=1)
-        memory = self.encoder(enc_tokens)
+        memory = torch.utils.checkpoint.checkpoint(self.encoder, enc_tokens, use_reentrant=False)
         bos = self.bos_token.expand(B, -1, -1)
         if T > 1:
             dec_input = torch.cat([bos] + [self.encode_frame(target_frames[:, t], t + 1)
@@ -141,20 +142,22 @@ class SpriteSeq2Seq(nn.Module):
             dec_input = bos
         tgt_len = dec_input.size(1)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
-        dec_out = self.decoder(dec_input, memory, tgt_mask=tgt_mask)
+        tgt_mask = tgt_mask.bool()
+        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, None, None, tgt_mask, use_reentrant=False)
         return self.out_proj(self._apply_skip(dec_out, memory))
 
     def forward_train(self, frame0, target_frames, row_labels):
         B, T, C, H, W = target_frames.shape
         enc_tokens = torch.cat([self.label_embed(row_labels).unsqueeze(1),
                                  self.encode_frame(frame0, 0)], dim=1)
-        memory = self.encoder(enc_tokens)
+        memory = torch.utils.checkpoint.checkpoint(self.encoder, enc_tokens, use_reentrant=False)
         all_tokens = torch.cat([self.encode_frame(target_frames[:, t], t + 1)
                                  for t in range(T)], dim=1)
         dec_input = torch.cat([self.bos_token.expand(B, -1, -1), all_tokens[:, :-1, :]], dim=1)
         tgt_len = dec_input.size(1)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
-        dec_out = self.decoder(dec_input, memory, tgt_mask=tgt_mask)
+        tgt_mask = tgt_mask.bool()
+        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, None, None, tgt_mask, use_reentrant=False)
         return torch.sigmoid(self.out_proj(self._apply_skip(dec_out, memory)))
 
     @torch.no_grad()
@@ -388,15 +391,17 @@ def train_one_epoch(model, loader, optimizer, device,
 
 
 @torch.no_grad()
-def eval_one_epoch(model, loader, device, perceptual_loss_fn=None):
+def eval_one_epoch(model, loader, device, perceptual_loss_fn=None, use_amp: bool = False):
     model.eval()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     total = 0.0
     val_bar = tqdm(loader, desc='  val', leave=False, unit='bat', dynamic_ncols=True)
     for frame0, target, row_labels, lengths in val_bar:
         frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
         row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
-        pred = model.forward_train(frame0, target, row_labels)
-        loss = compute_loss(pred, target, lengths, perceptual_loss_fn).item()
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            pred = model.forward_train(frame0, target, row_labels)
+            loss = compute_loss(pred, target, lengths, perceptual_loss_fn).item()
         total += loss
         val_bar.set_postfix(loss=f'{loss:.4f}')
     val_bar.close()
@@ -485,6 +490,8 @@ def parse_args():
                         help='Disable automatic mixed precision (bf16/fp16)')
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='Minimum learning rate for scheduler')
+    parser.add_argument('--min_frames', type=int, default=2,
+                        help='Minimum frames for curriculum schedule and dynamic batch scaling')
     return parser.parse_args()
 
 
@@ -509,9 +516,7 @@ def main():
                                     generator=torch.Generator().manual_seed(42))
     dataset_max_frames = max(s[2] - 1 for s in dataset.samples)
 
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=args.num_workers,
-                            pin_memory=True, persistent_workers=args.num_workers > 0)
+    val_loader = None
 
     model = SpriteSeq2Seq(d_model=args.d_model, dim_feedforward=args.dim_feedforward).to(device)
     tqdm.write(f'params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
@@ -553,23 +558,45 @@ def main():
         tqdm.write(f'resumed epoch {ckpt["epoch"]}')
 
     train_loader = None
+    val_loader = None
+    prev_batch = None
     epoch_bar = tqdm(range(start_epoch, args.epochs), desc='epochs', unit='ep', dynamic_ncols=True)
     for epoch in epoch_bar:
         curr_max = max(resume_curriculum_min,
                        get_curriculum_max_frames(epoch, args.epochs, max_frames=dataset_max_frames))
-        if train_loader is not None:
+
+        effective_batch = max(1, int(args.batch_size * args.min_frames / curr_max))
+        grad_accum = max(args.grad_accum, args.batch_size // effective_batch)
+
+        if train_loader is None or effective_batch != prev_batch:
+            if train_loader is not None:
+                del train_loader
+            train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
+                                      collate_fn=partial(collate_fn, max_frames=curr_max),
+                                      num_workers=args.num_workers, pin_memory=True,
+                                      persistent_workers=False)
+            prev_batch = effective_batch
+        else:
             del train_loader
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=partial(collate_fn, max_frames=curr_max),
-                                  num_workers=args.num_workers, pin_memory=True,
-                                  persistent_workers=False)
+            train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
+                                      collate_fn=partial(collate_fn, max_frames=curr_max),
+                                      num_workers=args.num_workers, pin_memory=True,
+                                      persistent_workers=False)
+
+        if val_loader is not None:
+            del val_loader
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                collate_fn=partial(collate_fn, max_frames=curr_max),
+                                num_workers=args.num_workers,
+                                pin_memory=True, persistent_workers=False)
 
         loss_G, loss_D = train_one_epoch(model, train_loader, optimizer, device,
                                          discriminator=discriminator, optimizer_D=optimizer_D,
                                          perceptual_loss_fn=perceptual_loss_fn, epoch=epoch,
-                                         scaler=scaler, grad_accum=args.grad_accum,
+                                         scaler=scaler, grad_accum=grad_accum,
                                          epoch_bar=epoch_bar)
-        val_loss = eval_one_epoch(model, val_loader, device, perceptual_loss_fn=perceptual_loss_fn)
+        val_loss = eval_one_epoch(model, val_loader, device, perceptual_loss_fn=perceptual_loss_fn,
+                                  use_amp=use_amp)
         scheduler.step()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -605,3 +632,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
