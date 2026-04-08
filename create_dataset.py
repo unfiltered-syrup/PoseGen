@@ -1,5 +1,7 @@
 import json
 import random
+import numpy as np
+from functools import lru_cache
 from pathlib import Path
 from PIL import Image
 
@@ -16,10 +18,14 @@ LAYER_ORDER = ['body', 'behind_body', 'legs', 'feet', 'torso', 'belt',
 
 
 def get_gender(path: Path) -> str:
-    parts = [p.lower() for p in path.parts]
-    if 'male' in parts and 'female' not in parts[:parts.index('male')]:
+    lower_parts = [p.lower() for p in path.parts]
+    has_female = 'female' in lower_parts
+    has_male   = 'male'   in lower_parts
+    if has_male and not has_female:
         return 'male'
-    return 'female' if 'female' in parts else 'unisex'
+    if has_male and has_female and lower_parts.index('male') > lower_parts.index('female'):
+        return 'female'
+    return 'female' if has_female else 'unisex'
 
 
 def scan(root: Path) -> dict:
@@ -41,16 +47,25 @@ def pick(catalog, category, gender):
     return random.choice(pool) if pool else None
 
 
-def pick_body(root, gender):
-    candidates = list((root / 'body' / gender).glob('*.png'))
-    return random.choice(candidates) if candidates else None
+_body_candidates: dict[str, list] = {}
+
+def pick_body(root: Path, gender: str) -> Path | None:
+    if gender not in _body_candidates:
+        _body_candidates[gender] = list((root / 'body' / gender).glob('*.png'))
+    pool = _body_candidates[gender]
+    return random.choice(pool) if pool else None
 
 
-def composite(paths, size):
+@lru_cache(maxsize=512)
+def _open_layer_cached(p: Path) -> Image.Image:
+    return Image.open(p).convert('RGBA')
+
+
+def composite(paths: list, size: tuple) -> Image.Image:
     canvas = Image.new('RGBA', size, (0, 0, 0, 0))
     for i, p in enumerate(paths):
         try:
-            layer = Image.open(p).convert('RGBA')
+            layer = _open_layer_cached(p)   # returns cached copy
             if layer.size != size:
                 layer = layer.resize(size, Image.NEAREST)
             canvas = Image.alpha_composite(canvas, layer)
@@ -60,20 +75,25 @@ def composite(paths, size):
     return canvas
 
 
-def extract_rows(img, entry_id, gender):
-    w, h = img.size
-    for row in range(h // ROW_HEIGHT):
-        top = row * ROW_HEIGHT
-        strip = img.crop((0, top, w, top + ROW_HEIGHT))
-        strip.save(FRAMES_DIR / f'entry_{entry_id:03d}_{gender}_row{row}.png')
+def extract_rows(img: Image.Image, entry_id: int, gender: str) -> None:
+    arr = np.asarray(img)
+    w   = img.width
+    n_rows = arr.shape[0] // ROW_HEIGHT
+    for row in range(n_rows):
+        strip_arr = arr[row * ROW_HEIGHT:(row + 1) * ROW_HEIGHT, :, :]
+        out = Image.fromarray(strip_arr)
+        out.save(
+            FRAMES_DIR / f'entry_{entry_id:03d}_{gender}_row{row}.png',
+            compress_level=1,
+        )
 
 
-def generate_entry(entry_id, gender, catalog, categories):
+def generate_entry(entry_id: int, gender: str, catalog: dict, categories: list) -> bool:
     body = pick_body(SPRITE_ROOT, gender)
     if body is None:
         return False
     try:
-        base = Image.open(body).convert('RGBA')
+        base = _open_layer_cached(body)
     except Exception:
         return False
 
@@ -96,7 +116,7 @@ def generate_entry(entry_id, gender, catalog, categories):
 
     sheet_path = OUTPUT_DIR / f'entry_{entry_id:03d}_{gender}.png'
     try:
-        sheet.save(sheet_path)
+        sheet.save(sheet_path, compress_level=1)
     except Exception:
         sheet_path.unlink(missing_ok=True)
         return False
@@ -120,7 +140,7 @@ def main():
     categories = [c for c in LAYER_ORDER if c in catalog]
 
     generated = skipped = 0
-    tasks = [('male', i) for i in range(50)] + [('female', i) for i in range(50, 100)]
+    tasks = [('male', i) for i in range(500)] + [('female', i) for i in range(500, 1000)]
     for gender, entry_id in tasks:
         if generate_entry(entry_id, gender, catalog, categories):
             generated += 1
