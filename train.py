@@ -200,6 +200,25 @@ class SpriteAnimDataset(Dataset):
         self.samples = []
         self._scan()
 
+    @staticmethod
+    def _png_size(path) -> tuple[int, int] | None:
+        """Read PNG width/height from the IHDR header bytes only (no decode).
+        PNG spec: bytes 0-7 = signature, bytes 8-15 = IHDR length+type,
+        bytes 16-19 = width (big-endian uint32), bytes 20-23 = height.
+        Returns (width, height) or None on failure.
+        """
+        import struct
+        try:
+            with open(path, 'rb') as f:
+                header = f.read(24)
+            if len(header) < 24 or header[:8] != b'\x89PNG\r\n\x1a\n':
+                return None
+            w = struct.unpack('>I', header[16:20])[0]
+            h = struct.unpack('>I', header[20:24])[0]
+            return w, h
+        except Exception:
+            return None
+
     def _scan(self):
         pattern = re.compile(r'entry_\d+_(?:male|female)_row(\d+)\.png$')
         for png in sorted(self.data_dir.glob('*.png')):
@@ -207,11 +226,10 @@ class SpriteAnimDataset(Dataset):
             if m is None:
                 continue
             row_label = int(m.group(1))
-            try:
-                img = Image.open(png).convert('RGB')
-            except Exception:
+            dims = self._png_size(png)
+            if dims is None:
                 continue
-            w, h = img.size
+            w, h = dims
             if h != FRAME_SIZE:
                 continue
             num_frames = w // FRAME_SIZE
