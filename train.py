@@ -138,7 +138,7 @@ class SpriteSeq2Seq(nn.Module):
         beta  = self.skip_beta(row_labels).unsqueeze(1)   # (B, 1, d_model)
         return dec_out + gamma * skip + beta
 
-    def forward(self, frame0, target_frames, row_labels):
+    def forward_inference(self, frame0, target_frames, row_labels):
         B, T = frame0.size(0), target_frames.size(1)
         seq_len = torch.tensor([T], dtype=torch.long, device=frame0.device).expand(B)
         enc_tokens = torch.cat([
@@ -158,7 +158,7 @@ class SpriteSeq2Seq(nn.Module):
         dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, tgt_mask, None, None, None, use_reentrant=False)
         return self.out_proj(self._apply_skip(dec_out, memory, row_labels))
 
-    def forward_train(self, frame0, target_frames, row_labels, lengths=None):
+    def forward(self, frame0, target_frames, row_labels, lengths=None):
         B, T, C, H, W = target_frames.shape
         seq_len = torch.tensor([T], dtype=torch.long, device=frame0.device).expand(B)
         enc_tokens = torch.cat([
@@ -187,7 +187,7 @@ class SpriteSeq2Seq(nn.Module):
     @torch.no_grad()
     def generate(self, frame0, row_label, num_frames):
         dummy_targets = frame0.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
-        pred = self.forward_train(frame0, dummy_targets, row_label)
+        pred = self.forward(frame0, dummy_targets, row_label)
         B, T_patches, D = pred.shape
         T = T_patches // NUM_PATCHES
         patches = pred.view(B, T, NUM_PATCHES, PATCH_DIM)
@@ -460,7 +460,7 @@ def train_one_epoch(model, loader, optimizer, device,
         B, T, C, H, W = target.shape
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            pred = model.forward_train(frame0, target, row_labels, lengths)
+            pred = model(frame0, target, row_labels, lengths)
             pred_frames = patches_to_frame(pred.view(B * T, NUM_PATCHES, PATCH_DIM))
             target_flat = target.view(B * T, C, H, W)
 
@@ -535,7 +535,7 @@ def eval_one_epoch(model, loader, device, perceptual_loss_fn=None, use_amp: bool
         frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
         row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            pred = model.forward_train(frame0, target, row_labels, lengths)
+            pred = model(frame0, target, row_labels, lengths)
             loss = compute_loss(pred, target, lengths, perceptual_loss_fn, row_labels=row_labels).item()
         total += loss
         val_bar.set_postfix(loss=f'{loss:.4f}')
