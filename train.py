@@ -248,7 +248,14 @@ class SpriteAnimDataset(Dataset):
             return None
 
         with ThreadPool(n_threads) as pool:
-            results = pool.map(_check, candidates, chunksize=256)
+            results = list(tqdm(
+                pool.imap(_check, candidates, chunksize=256),
+                total=len(candidates),
+                desc='scanning dataset',
+                unit='file',
+                ascii=True,
+                dynamic_ncols=True,
+            ))
 
         self.samples = [r for r in results if r is not None]
         self.samples.sort(key=lambda x: str(x[0]))
@@ -453,7 +460,7 @@ def train_one_epoch(model, loader, optimizer, device,
     use_amp = scaler is not None
 
     optimizer.zero_grad()
-    batch_bar = tqdm(loader, desc=f'  batches', leave=False, unit='bat', dynamic_ncols=True)
+    batch_bar = tqdm(loader, desc=f'  batches', leave=False, unit='bat', ascii=True, dynamic_ncols=True)
     for step, (frame0, target, row_labels, lengths) in enumerate(batch_bar):
         frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
         row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
@@ -530,7 +537,7 @@ def eval_one_epoch(model, loader, device, perceptual_loss_fn=None, use_amp: bool
     model.eval()
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     total = 0.0
-    val_bar = tqdm(loader, desc='  val', leave=False, unit='bat', dynamic_ncols=True)
+    val_bar = tqdm(loader, desc='  val', leave=False, unit='bat', ascii=True, dynamic_ncols=True)
     for frame0, target, row_labels, lengths in val_bar:
         frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
         row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
@@ -718,7 +725,7 @@ def main():
     train_loader = None
     val_loader = None
     prev_batch = None
-    epoch_bar = tqdm(range(start_epoch, args.epochs), desc='epochs', unit='ep', dynamic_ncols=True)
+    epoch_bar = tqdm(range(start_epoch, args.epochs), desc='epochs', unit='ep', ascii=True, dynamic_ncols=True)
     for epoch in epoch_bar:
         curr_max = max(resume_curriculum_min,
                        get_curriculum_max_frames(epoch, args.epochs, max_frames=dataset_max_frames))
