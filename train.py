@@ -123,7 +123,6 @@ class SpriteSeq2Seq(nn.Module):
 
     def _apply_skip(self, dec_out: torch.Tensor, memory: torch.Tensor, row_labels: torch.Tensor) -> torch.Tensor:
         B = dec_out.size(0)
-        # Change 2+3: skip both prefix tokens (label + length), apply FiLM modulation
         enc_proj = self.skip_proj(memory[:, 2:, :])
         tgt_len = dec_out.size(1)
         nf = tgt_len // NUM_PATCHES
@@ -277,7 +276,7 @@ class FrameCountBucketSampler(torch.utils.data.Sampler):
         # DDP rank slicing
         batches = batches[self.rank::self.world_size]
         for batch in batches:
-            yield from batch
+            yield batch
 
     def __len__(self):
         total = 0
