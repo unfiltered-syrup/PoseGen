@@ -111,9 +111,13 @@ class SpriteSeq2Seq(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and 'embed' not in name:
                 nn.init.xavier_uniform_(p)
+        nn.init.ones_(self.skip_gamma.weight)
+        nn.init.zeros_(self.skip_beta.weight)
+        nn.init.normal_(self.bos_embed.weight, std=0.02)
+        nn.init.normal_(self.length_embed.weight, std=0.02)
 
     def encode_frame(self, frame: torch.Tensor, frame_idx: int) -> torch.Tensor:
         tokens = self.patch_proj(frame_to_patches(frame))
@@ -421,9 +425,9 @@ def compute_loss(pred, target, lengths, perceptual_loss_fn=None, row_labels=None
     perc = perceptual_loss_fn(pv, tv) if perceptual_loss_fn is not None else torch.tensor(0.0, device=pred.device)
     if valid_weights is not None:
         l1 = (F.l1_loss(pv, tv, reduction='none').mean(dim=[1, 2, 3]) * valid_weights).mean()
-        return 0.1 * l1 + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
+        return 0.5 * l1 + 0.1 * perc + 0.3 * ssim_loss(pv, tv)
     else:
-        return 0.1 * F.l1_loss(pv, tv) + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
+        return 0.5 * F.l1_loss(pv, tv) + 0.1 * perc + 0.3 * ssim_loss(pv, tv)
 
 
 class PatchDiscriminator(nn.Module):
@@ -440,7 +444,7 @@ class PatchDiscriminator(nn.Module):
         return self.net(x)
 
 
-GAN_WARMUP_EPOCHS = 5
+GAN_WARMUP_EPOCHS = 20
 D_NOISE_STD = 0.05
 D_REAL_LABEL = 0.9
 ADV_LOSS_WEIGHT = 0.001
@@ -622,7 +626,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--data_dir', type=str, default='./data_output/frames')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     parser.add_argument('--d_model', type=int, default=512)
@@ -637,7 +641,7 @@ def parse_args():
                         help='Disable automatic mixed precision (bf16/fp16)')
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='Minimum learning rate for scheduler')
-    parser.add_argument('--min_frames', type=int, default=3,
+    parser.add_argument('--min_frames', type=int, default=5,
                         help='Minimum frames for curriculum schedule and dynamic batch scaling')
     parser.add_argument('--use_bucket_sampler', action='store_true',
                         help='Use FrameCountBucketSampler to group batches by frame count (reduces padding waste)')
