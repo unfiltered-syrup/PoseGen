@@ -9,11 +9,14 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, DistributedSampler, random_split
 from PIL import Image
 from einops import rearrange
 from tqdm import tqdm
+
 
 try:
     import torchvision.models as tvm
@@ -76,7 +79,7 @@ class TemporalPosEncoding(nn.Module):
 class SpriteSeq2Seq(nn.Module):
     def __init__(
         self,
-        d_model: int = 768,
+        d_model: int = 512,
         nhead: int = 16,
         num_encoder_layers: int = 12,
         num_decoder_layers: int = 12,
@@ -91,7 +94,8 @@ class SpriteSeq2Seq(nn.Module):
         self.spatial_pos = SpatialPosEncoding(d_model)
         self.temporal_pos = TemporalPosEncoding(d_model, max_len=max_frames)
         self.label_embed = nn.Embedding(num_row_labels, d_model)
-        self.bos_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.bos_embed = nn.Embedding(num_row_labels, d_model)
+        self.length_embed = nn.Embedding(max_frames + 1, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True)
@@ -101,7 +105,9 @@ class SpriteSeq2Seq(nn.Module):
             dropout=dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         self.out_proj = nn.Linear(d_model, PATCH_DIM)
-        self.skip_proj = nn.Linear(d_model, d_model)
+        self.skip_proj  = nn.Linear(d_model, d_model)
+        self.skip_gamma = nn.Embedding(num_row_labels, d_model)
+        self.skip_beta  = nn.Embedding(num_row_labels, d_model)
         self._init_weights()
 
     def _init_weights(self):
@@ -115,9 +121,10 @@ class SpriteSeq2Seq(nn.Module):
         tokens = tokens + self.temporal_pos(frame_idx).unsqueeze(0).unsqueeze(0)
         return tokens
 
-    def _apply_skip(self, dec_out: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def _apply_skip(self, dec_out: torch.Tensor, memory: torch.Tensor, row_labels: torch.Tensor) -> torch.Tensor:
         B = dec_out.size(0)
-        enc_proj = self.skip_proj(memory[:, 1:, :])
+        # Change 2+3: skip both prefix tokens (label + length), apply FiLM modulation
+        enc_proj = self.skip_proj(memory[:, 2:, :])
         tgt_len = dec_out.size(1)
         nf = tgt_len // NUM_PATCHES
         rem = tgt_len % NUM_PATCHES
@@ -127,14 +134,21 @@ class SpriteSeq2Seq(nn.Module):
             skip = torch.cat([tiled, enc_proj[:, :rem, :]], dim=1) if rem > 0 else tiled
         else:
             skip = enc_proj[:, :rem, :]
-        return dec_out + skip
+        # FiLM modulation
+        gamma = self.skip_gamma(row_labels).unsqueeze(1)  # (B, 1, d_model)
+        beta  = self.skip_beta(row_labels).unsqueeze(1)   # (B, 1, d_model)
+        return dec_out + gamma * skip + beta
 
     def forward(self, frame0, target_frames, row_labels):
         B, T = frame0.size(0), target_frames.size(1)
-        enc_tokens = torch.cat([self.label_embed(row_labels).unsqueeze(1),
-                                 self.encode_frame(frame0, 0)], dim=1)
+        seq_len = torch.tensor([T], dtype=torch.long, device=frame0.device).expand(B)
+        enc_tokens = torch.cat([
+            self.label_embed(row_labels).unsqueeze(1),
+            self.length_embed(seq_len).unsqueeze(1),
+            self.encode_frame(frame0, 0)
+        ], dim=1)
         memory = torch.utils.checkpoint.checkpoint(self.encoder, enc_tokens, use_reentrant=False)
-        bos = self.bos_token.expand(B, -1, -1)
+        bos = self.bos_embed(row_labels).unsqueeze(1)  # (B, 1, d_model)
         if T > 1:
             dec_input = torch.cat([bos] + [self.encode_frame(target_frames[:, t], t + 1)
                                            for t in range(T - 1)], dim=1)
@@ -142,23 +156,34 @@ class SpriteSeq2Seq(nn.Module):
             dec_input = bos
         tgt_len = dec_input.size(1)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
-        tgt_mask = tgt_mask.bool()
-        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, None, None, tgt_mask, use_reentrant=False)
-        return self.out_proj(self._apply_skip(dec_out, memory))
+        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, tgt_mask, None, None, None, use_reentrant=False)
+        return self.out_proj(self._apply_skip(dec_out, memory, row_labels))
 
-    def forward_train(self, frame0, target_frames, row_labels):
+    def forward_train(self, frame0, target_frames, row_labels, lengths=None):
         B, T, C, H, W = target_frames.shape
-        enc_tokens = torch.cat([self.label_embed(row_labels).unsqueeze(1),
-                                 self.encode_frame(frame0, 0)], dim=1)
+        seq_len = torch.tensor([T], dtype=torch.long, device=frame0.device).expand(B)
+        enc_tokens = torch.cat([
+            self.label_embed(row_labels).unsqueeze(1),
+            self.length_embed(seq_len).unsqueeze(1),
+            self.encode_frame(frame0, 0)
+        ], dim=1)
         memory = torch.utils.checkpoint.checkpoint(self.encoder, enc_tokens, use_reentrant=False)
         all_tokens = torch.cat([self.encode_frame(target_frames[:, t], t + 1)
                                  for t in range(T)], dim=1)
-        dec_input = torch.cat([self.bos_token.expand(B, -1, -1), all_tokens[:, :-1, :]], dim=1)
+        bos = self.bos_embed(row_labels).unsqueeze(1)
+        dec_input = torch.cat([bos, all_tokens[:, :-1, :]], dim=1)
         tgt_len = dec_input.size(1)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
-        tgt_mask = tgt_mask.bool()
-        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, None, None, tgt_mask, use_reentrant=False)
-        return torch.sigmoid(self.out_proj(self._apply_skip(dec_out, memory)))
+        tgt_key_pad = None
+        if lengths is not None:
+            tgt_key_pad = torch.ones(B, tgt_len, dtype=torch.bool, device=frame0.device)
+            for i, l in enumerate(lengths):
+                valid_tokens = min(int(l) * NUM_PATCHES, tgt_len)
+                tgt_key_pad[i, :valid_tokens] = False
+        dec_out = torch.utils.checkpoint.checkpoint(
+            self.decoder, dec_input, memory, tgt_mask, None, tgt_key_pad, None, use_reentrant=False
+        )
+        return torch.sigmoid(self.out_proj(self._apply_skip(dec_out, memory, row_labels)))
 
     @torch.no_grad()
     def generate(self, frame0, row_label, num_frames):
@@ -203,6 +228,63 @@ class SpriteAnimDataset(Dataset):
         img_tensor = TF.to_tensor(Image.open(png_path).convert('RGB'))
         frames = [img_tensor[:, :, i * FRAME_SIZE:(i + 1) * FRAME_SIZE] for i in range(num_frames)]
         return frames[0], torch.stack(frames[1:], dim=0), row_label
+
+
+class FrameCountBucketSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, batch_size: int,
+                 drop_last: bool = True, shuffle: bool = True,
+                 rank: int = 0, world_size: int = 1):
+        self.batch_size = batch_size
+        self.drop_last  = drop_last
+        self.shuffle    = shuffle
+        self.rank       = rank
+        self.world_size = world_size
+        self.epoch      = 0
+
+        # Handle Subset datasets
+        if hasattr(dataset, 'indices'):
+            valid_indices = set(dataset.indices)
+            actual_dataset = dataset.dataset
+        else:
+            valid_indices = None
+            actual_dataset = dataset
+
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for i, (_, _, nf) in enumerate(actual_dataset.samples):
+            if valid_indices is None or i in valid_indices:
+                buckets[nf].append(i)
+        self._buckets = dict(buckets)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        import random as _random
+        rng = _random.Random(self.epoch)
+        batches = []
+        for nf, idxs in self._buckets.items():
+            idxs = list(idxs)
+            if self.shuffle:
+                rng.shuffle(idxs)
+            for start in range(0, len(idxs), self.batch_size):
+                batch = idxs[start:start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        # DDP rank slicing
+        batches = batches[self.rank::self.world_size]
+        for batch in batches:
+            yield from batch
+
+    def __len__(self):
+        total = 0
+        for idxs in self._buckets.values():
+            n = len(idxs) // self.batch_size
+            total += n
+        return (total // self.world_size) * self.batch_size
 
 
 def collate_fn(batch, max_frames=None):
@@ -268,7 +350,7 @@ def ssim_loss(pred, target, window_size=7):
     return 1.0 - ssim_map.mean()
 
 
-def compute_loss(pred, target, lengths, perceptual_loss_fn=None):
+def compute_loss(pred, target, lengths, perceptual_loss_fn=None, row_labels=None):
     B, T, C, H, W = target.shape
     pred_frames = patches_to_frame(pred.view(B * T, NUM_PATCHES, PATCH_DIM))
     target_flat = target.view(B * T, C, H, W)
@@ -279,8 +361,19 @@ def compute_loss(pred, target, lengths, perceptual_loss_fn=None):
     if valid.sum() == 0:
         return pred.sum() * 0.0
     pv, tv = pred_frames[valid], target_flat[valid]
+    if row_labels is not None:
+        frame_weights = (1.0 / lengths.float().clamp(min=1)).to(pred.device)
+        frame_weights = frame_weights / frame_weights.mean()  # normalize to mean=1
+        weight_expanded = frame_weights.unsqueeze(1).expand(B, T).reshape(B * T)
+        valid_weights = weight_expanded[valid]
+    else:
+        valid_weights = None
     perc = perceptual_loss_fn(pv, tv) if perceptual_loss_fn is not None else torch.tensor(0.0, device=pred.device)
-    return 0.1 * F.l1_loss(pv, tv) + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
+    if valid_weights is not None:
+        l1 = (F.l1_loss(pv, tv, reduction='none').mean(dim=[1, 2, 3]) * valid_weights).mean()
+        return 0.1 * l1 + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
+    else:
+        return 0.1 * F.l1_loss(pv, tv) + 0.1 * perc + 0.5 * ssim_loss(pv, tv)
 
 
 class PatchDiscriminator(nn.Module):
@@ -325,7 +418,7 @@ def train_one_epoch(model, loader, optimizer, device,
         B, T, C, H, W = target.shape
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            pred = model.forward_train(frame0, target, row_labels)
+            pred = model.forward_train(frame0, target, row_labels, lengths)
             pred_frames = patches_to_frame(pred.view(B * T, NUM_PATCHES, PATCH_DIM))
             target_flat = target.view(B * T, C, H, W)
 
@@ -356,7 +449,7 @@ def train_one_epoch(model, loader, optimizer, device,
             total_D += loss_D.item()
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            recon = compute_loss(pred, target, lengths, perceptual_loss_fn)
+            recon = compute_loss(pred, target, lengths, perceptual_loss_fn, row_labels=row_labels)
             if gan_active:
                 adv_out = discriminator(pred_frames[valid])
                 loss_G = (recon + ADV_LOSS_WEIGHT * bce(adv_out, torch.ones_like(adv_out))) / grad_accum
@@ -400,8 +493,8 @@ def eval_one_epoch(model, loader, device, perceptual_loss_fn=None, use_amp: bool
         frame0, target = frame0.to(device, non_blocking=True), target.to(device, non_blocking=True)
         row_labels, lengths = row_labels.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            pred = model.forward_train(frame0, target, row_labels)
-            loss = compute_loss(pred, target, lengths, perceptual_loss_fn).item()
+            pred = model.forward_train(frame0, target, row_labels, lengths)
+            loss = compute_loss(pred, target, lengths, perceptual_loss_fn, row_labels=row_labels).item()
         total += loss
         val_bar.set_postfix(loss=f'{loss:.4f}')
     val_bar.close()
@@ -471,18 +564,22 @@ def generate_animation(model, frame_0_path: str, row_label: int, num_frames: int
     strip.save(output_path)
 
 
+def is_main_process():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--data_dir', type=str, default='./data_output/frames')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--dim_feedforward', type=int, default=2048)
+    parser.add_argument('--dim_feedforward', type=int, default=4096)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--rows', type=int, nargs='+', default=None)
-    parser.add_argument('--num_workers', type=int, default=8,
+    parser.add_argument('--num_workers', type=int, default=10,
                         help='DataLoader worker processes per loader')
     parser.add_argument('--grad_accum', type=int, default=1,
                         help='Gradient accumulation steps (simulate larger batch)')
@@ -490,14 +587,24 @@ def parse_args():
                         help='Disable automatic mixed precision (bf16/fp16)')
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='Minimum learning rate for scheduler')
-    parser.add_argument('--min_frames', type=int, default=2,
+    parser.add_argument('--min_frames', type=int, default=3,
                         help='Minimum frames for curriculum schedule and dynamic batch scaling')
+    parser.add_argument('--use_bucket_sampler', action='store_true',
+                        help='Use FrameCountBucketSampler to group batches by frame count (reduces padding waste)')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    ddp = world_size > 1
+    if ddp:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tqdm.write(f'device: {device}')
 
     use_amp = not args.no_amp and device.type == 'cuda'
@@ -534,6 +641,13 @@ def main():
     discriminator = PatchDiscriminator().to(device)
     optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999))
 
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        discriminator = DDP(discriminator, device_ids=[local_rank])
+
+    raw_model = model.module if ddp else model
+    raw_disc  = discriminator.module if ddp else discriminator
+
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     start_epoch = 0
     best_val_loss = float('inf')
@@ -541,13 +655,15 @@ def main():
     train_losses_G, train_losses_D, val_losses = [], [], []
 
     if args.resume and os.path.isfile(args.resume):
+        if ddp:
+            dist.barrier()
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model_state'])
+        raw_model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optimizer_state'])
         disc_state = ckpt.get('discriminator_state')
         opt_d_state = ckpt.get('optimizer_D_state')
         if disc_state:
-            discriminator.load_state_dict(disc_state)
+            raw_disc.load_state_dict(disc_state)
         if opt_d_state:
             optimizer_D.load_state_dict(opt_d_state)
         resume_curriculum_min = ckpt.get('curriculum_max_frames', 2)
@@ -571,24 +687,89 @@ def main():
         if train_loader is None or effective_batch != prev_batch:
             if train_loader is not None:
                 del train_loader
-            train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
-                                      collate_fn=partial(collate_fn, max_frames=curr_max),
-                                      num_workers=args.num_workers, pin_memory=True,
-                                      persistent_workers=False)
+            if args.use_bucket_sampler:
+                bucket_sampler = FrameCountBucketSampler(
+                    train_ds,
+                    batch_size=effective_batch,
+                    drop_last=True,
+                    shuffle=True,
+                    rank=local_rank if ddp else 0,
+                    world_size=world_size if ddp else 1,
+                )
+                bucket_sampler.set_epoch(epoch)
+                train_loader = DataLoader(
+                    train_ds,
+                    batch_sampler=bucket_sampler,
+                    collate_fn=partial(collate_fn, max_frames=curr_max),
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    persistent_workers=False,
+                )
+            elif ddp:
+                train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+                train_loader = DataLoader(train_ds, batch_size=effective_batch,
+                                          sampler=train_sampler,
+                                          collate_fn=partial(collate_fn, max_frames=curr_max),
+                                          num_workers=args.num_workers, pin_memory=True,
+                                          persistent_workers=False)
+            else:
+                train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
+                                          collate_fn=partial(collate_fn, max_frames=curr_max),
+                                          num_workers=args.num_workers, pin_memory=True,
+                                          persistent_workers=False)
             prev_batch = effective_batch
         else:
             del train_loader
-            train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
-                                      collate_fn=partial(collate_fn, max_frames=curr_max),
-                                      num_workers=args.num_workers, pin_memory=True,
-                                      persistent_workers=False)
+            if args.use_bucket_sampler:
+                bucket_sampler = FrameCountBucketSampler(
+                    train_ds,
+                    batch_size=effective_batch,
+                    drop_last=True,
+                    shuffle=True,
+                    rank=local_rank if ddp else 0,
+                    world_size=world_size if ddp else 1,
+                )
+                bucket_sampler.set_epoch(epoch)
+                train_loader = DataLoader(
+                    train_ds,
+                    batch_sampler=bucket_sampler,
+                    collate_fn=partial(collate_fn, max_frames=curr_max),
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    persistent_workers=False,
+                )
+            elif ddp:
+                train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+                train_loader = DataLoader(train_ds, batch_size=effective_batch,
+                                          sampler=train_sampler,
+                                          collate_fn=partial(collate_fn, max_frames=curr_max),
+                                          num_workers=args.num_workers, pin_memory=True,
+                                          persistent_workers=False)
+            else:
+                train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=True,
+                                          collate_fn=partial(collate_fn, max_frames=curr_max),
+                                          num_workers=args.num_workers, pin_memory=True,
+                                          persistent_workers=False)
 
         if val_loader is not None:
             del val_loader
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                                collate_fn=partial(collate_fn, max_frames=curr_max),
-                                num_workers=args.num_workers,
-                                pin_memory=True, persistent_workers=False)
+        if ddp:
+            val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
+            val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                                    sampler=val_sampler,
+                                    collate_fn=partial(collate_fn, max_frames=curr_max),
+                                    num_workers=args.num_workers, pin_memory=True,
+                                    persistent_workers=False)
+        else:
+            val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                    collate_fn=partial(collate_fn, max_frames=curr_max),
+                                    num_workers=args.num_workers,
+                                    pin_memory=True, persistent_workers=False)
+
+        if ddp and not args.use_bucket_sampler:
+            train_sampler.set_epoch(epoch)
+        elif args.use_bucket_sampler:
+            bucket_sampler.set_epoch(epoch)
 
         loss_G, loss_D = train_one_epoch(model, train_loader, optimizer, device,
                                          discriminator=discriminator, optimizer_D=optimizer_D,
@@ -605,29 +786,36 @@ def main():
         train_losses_D.append(loss_D)
         val_losses.append(val_loss)
 
-        epoch_bar.set_postfix(G=f'{loss_G:.4f}', D=f'{loss_D:.4f}', val=f'{val_loss:.4f}', cur=curr_max)
-        tqdm.write(f'epoch {epoch+1:3d}/{args.epochs}  G={loss_G:.5f}  D={loss_D:.5f}  val={val_loss:.5f}  cur={curr_max}')
+        if is_main_process():
+            epoch_bar.set_postfix(G=f'{loss_G:.4f}', D=f'{loss_D:.4f}', val=f'{val_loss:.4f}', cur=curr_max)
+            tqdm.write(f'epoch {epoch+1:3d}/{args.epochs}  G={loss_G:.5f}  D={loss_D:.5f}  val={val_loss:.5f}  cur={curr_max}')
 
         if (epoch + 1) % 10 == 0:
-            save_checkpoint(model, optimizer, epoch,
-                            os.path.join(args.checkpoint_dir, f'epoch_{epoch+1}.pt'),
-                            discriminator=discriminator, optimizer_D=optimizer_D,
-                            curriculum_max_frames=curr_max,
-                            train_losses_G=train_losses_G, train_losses_D=train_losses_D,
-                            val_losses=val_losses)
-            plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
+            if is_main_process():
+                save_checkpoint(raw_model, optimizer, epoch,
+                                os.path.join(args.checkpoint_dir, f'epoch_{epoch+1}.pt'),
+                                discriminator=raw_disc, optimizer_D=optimizer_D,
+                                curriculum_max_frames=curr_max,
+                                train_losses_G=train_losses_G, train_losses_D=train_losses_D,
+                                val_losses=val_losses)
+                plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, optimizer, epoch,
-                            os.path.join(args.checkpoint_dir, 'best_model.pt'),
-                            discriminator=discriminator, optimizer_D=optimizer_D,
-                            curriculum_max_frames=curr_max,
-                            train_losses_G=train_losses_G, train_losses_D=train_losses_D,
-                            val_losses=val_losses)
+            if is_main_process():
+                save_checkpoint(raw_model, optimizer, epoch,
+                                os.path.join(args.checkpoint_dir, 'best_model.pt'),
+                                discriminator=raw_disc, optimizer_D=optimizer_D,
+                                curriculum_max_frames=curr_max,
+                                train_losses_G=train_losses_G, train_losses_D=train_losses_D,
+                                val_losses=val_losses)
 
-    plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
-    tqdm.write(f'done. best val={best_val_loss:.5f}')
+    if is_main_process():
+        plot_losses(train_losses_G, train_losses_D, val_losses, './plot')
+        tqdm.write(f'done. best val={best_val_loss:.5f}')
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
