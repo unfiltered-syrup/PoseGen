@@ -220,21 +220,38 @@ class SpriteAnimDataset(Dataset):
             return None
 
     def _scan(self):
+        import os
+        from multiprocessing.pool import ThreadPool
+
         pattern = re.compile(r'entry_\d+_(?:male|female)_row(\d+)\.png$')
-        for png in sorted(self.data_dir.glob('*.png')):
+        all_pngs = sorted(self.data_dir.glob('*.png'))
+
+        candidates = []
+        for png in all_pngs:
             m = pattern.match(png.name)
-            if m is None:
-                continue
-            row_label = int(m.group(1))
+            if m is not None:
+                candidates.append((png, int(m.group(1))))
+
+        n_threads = min(32, os.cpu_count() or 4)
+
+        def _check(args):
+            png, row_label = args
             dims = self._png_size(png)
             if dims is None:
-                continue
+                return None
             w, h = dims
             if h != FRAME_SIZE:
-                continue
+                return None
             num_frames = w // FRAME_SIZE
             if num_frames >= 2:
-                self.samples.append((png, row_label, num_frames))
+                return (png, row_label, num_frames)
+            return None
+
+        with ThreadPool(n_threads) as pool:
+            results = pool.map(_check, candidates, chunksize=256)
+
+        self.samples = [r for r in results if r is not None]
+        self.samples.sort(key=lambda x: str(x[0]))
 
     def __len__(self):
         return len(self.samples)
@@ -260,16 +277,25 @@ class FrameCountBucketSampler(torch.utils.data.Sampler):
 
         # Handle Subset datasets
         if hasattr(dataset, 'indices'):
-            valid_indices = set(dataset.indices)
             actual_dataset = dataset.dataset
+            valid_indices = set(dataset.indices)
+            abs_to_local = {abs_idx: local_idx for local_idx, abs_idx in enumerate(dataset.indices)}
         else:
-            valid_indices = None
             actual_dataset = dataset
+            valid_indices = None
+            abs_to_local = None
 
         from collections import defaultdict
         buckets = defaultdict(list)
         for i, (_, _, nf) in enumerate(actual_dataset.samples):
-            if valid_indices is None or i in valid_indices:
+            if valid_indices is not None and i not in valid_indices:
+                continue
+            if abs_to_local is not None:
+                local_i = abs_to_local.get(i)
+                if local_i is None:
+                    continue
+                buckets[nf].append(local_i)
+            else:
                 buckets[nf].append(i)
         self._buckets = dict(buckets)
 
@@ -291,7 +317,6 @@ class FrameCountBucketSampler(torch.utils.data.Sampler):
                 batches.append(batch)
         if self.shuffle:
             rng.shuffle(batches)
-        # DDP rank slicing
         batches = batches[self.rank::self.world_size]
         for batch in batches:
             yield batch
@@ -380,7 +405,7 @@ def compute_loss(pred, target, lengths, perceptual_loss_fn=None, row_labels=None
     pv, tv = pred_frames[valid], target_flat[valid]
     if row_labels is not None:
         frame_weights = (1.0 / lengths.float().clamp(min=1)).to(pred.device)
-        frame_weights = frame_weights / frame_weights.mean()  # normalize to mean=1
+        frame_weights = frame_weights / frame_weights.mean()
         weight_expanded = frame_weights.unsqueeze(1).expand(B, T).reshape(B * T)
         valid_weights = weight_expanded[valid]
     else:
