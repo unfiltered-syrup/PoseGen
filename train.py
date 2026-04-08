@@ -154,8 +154,15 @@ class SpriteSeq2Seq(nn.Module):
         else:
             dec_input = bos
         tgt_len = dec_input.size(1)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
-        dec_out = torch.utils.checkpoint.checkpoint(self.decoder, dec_input, memory, tgt_mask, None, None, None, use_reentrant=False)
+        dec_out = torch.utils.checkpoint.checkpoint(
+            self.decoder, dec_input, memory,
+            None,
+            None,
+            None,
+            None,
+            True,
+            use_reentrant=False
+        )
         return self.out_proj(self._apply_skip(dec_out, memory, row_labels))
 
     def forward(self, frame0, target_frames, row_labels, lengths=None):
@@ -172,7 +179,7 @@ class SpriteSeq2Seq(nn.Module):
         bos = self.bos_embed(row_labels).unsqueeze(1)
         dec_input = torch.cat([bos, all_tokens[:, :-1, :]], dim=1)
         tgt_len = dec_input.size(1)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device)
+
         tgt_key_pad = None
         if lengths is not None:
             tgt_key_pad = torch.ones(B, tgt_len, dtype=torch.bool, device=frame0.device)
@@ -180,7 +187,13 @@ class SpriteSeq2Seq(nn.Module):
                 valid_tokens = min(int(l) * NUM_PATCHES, tgt_len)
                 tgt_key_pad[i, :valid_tokens] = False
         dec_out = torch.utils.checkpoint.checkpoint(
-            self.decoder, dec_input, memory, tgt_mask, None, tgt_key_pad, None, use_reentrant=False
+            self.decoder, dec_input, memory,
+            None,       
+            None,       
+            tgt_key_pad,
+            None,       
+            True,       
+            use_reentrant=False
         )
         return torch.sigmoid(self.out_proj(self._apply_skip(dec_out, memory, row_labels)))
 
@@ -202,11 +215,6 @@ class SpriteAnimDataset(Dataset):
 
     @staticmethod
     def _png_size(path) -> tuple[int, int] | None:
-        """Read PNG width/height from the IHDR header bytes only (no decode).
-        PNG spec: bytes 0-7 = signature, bytes 8-15 = IHDR length+type,
-        bytes 16-19 = width (big-endian uint32), bytes 20-23 = height.
-        Returns (width, height) or None on failure.
-        """
         import struct
         try:
             with open(path, 'rb') as f:
