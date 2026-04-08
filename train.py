@@ -154,13 +154,13 @@ class SpriteSeq2Seq(nn.Module):
         else:
             dec_input = bos
         tgt_len = dec_input.size(1)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device).bool()
         dec_out = torch.utils.checkpoint.checkpoint(
             self.decoder, dec_input, memory,
-            None,
-            None,
-            None,
-            None,
-            True,
+            tgt_mask,   
+            None,       
+            None,       
+            None,       
             use_reentrant=False
         )
         return self.out_proj(self._apply_skip(dec_out, memory, row_labels))
@@ -179,20 +179,13 @@ class SpriteSeq2Seq(nn.Module):
         bos = self.bos_embed(row_labels).unsqueeze(1)
         dec_input = torch.cat([bos, all_tokens[:, :-1, :]], dim=1)
         tgt_len = dec_input.size(1)
-
-        tgt_key_pad = None
-        if lengths is not None:
-            tgt_key_pad = torch.ones(B, tgt_len, dtype=torch.bool, device=frame0.device)
-            for i, l in enumerate(lengths):
-                valid_tokens = min(int(l) * NUM_PATCHES, tgt_len)
-                tgt_key_pad[i, :valid_tokens] = False
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=frame0.device).bool()
         dec_out = torch.utils.checkpoint.checkpoint(
             self.decoder, dec_input, memory,
-            None,       
-            None,       
-            tgt_key_pad,
-            None,       
-            True,       
+            tgt_mask,    
+            None,        
+            None,        
+            None,        
             use_reentrant=False
         )
         return torch.sigmoid(self.out_proj(self._apply_skip(dec_out, memory, row_labels)))
