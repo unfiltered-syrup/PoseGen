@@ -1,93 +1,153 @@
-# 2d Animation Generation From Single Sprites
+# Pixel Sprite Animation From a Single Frame
+
+This project compares three ways to generate small 2D game animations from a single sprite frame: deterministic warping, a learned sequential transformer, and a large image-to-video model (Wan2.2). 
+
+<p align="center">
+  <img src="assets/output_samples/sample_walk_1.gif" width="120" alt="Generated walk sample 1" />
+  <img src="assets/output_samples/sample_walk_2.gif" width="120" alt="Generated walk sample 2" />
+  <img src="assets/output_samples/sample_walk_3.gif" width="120" alt="Generated walk sample 3" />
+  <img src="assets/output_samples/sample_walk_4.gif" width="120" alt="Generated walk sample 4" />
+</p>
+
+## link to trained weight for optimal model: https://drive.google.com/file/d/1-XOIEJaB_HS8Vc2rQ5HXzE4iJZHI3qZ7/view?usp=sharing
+
+## Project Overview
+
+The original goal was to support a game-editor workflow where a developer provides one idle or first-frame sprite and receives a short action animation without drawing every frame manually. The project studies the quality, flexibility, and compute tradeoffs across three levels:
+
+| Level | Method | Strength | Limitation |
+| --- | --- | --- | --- |
+| 1 | TPS / RBF warp | Very fast and deterministic | Cannot create occluded details or new structure |
+| 2 | MSE transformer baseline | Learns row-specific motion order | Blurs outlines and tiny pixel-art details |
+| 3 | Transformer with updated objective function | Best current quality-compute balance | Still tied to LPC-style sprites, need retraining for new animations |
+| Modern option | Wan2.2 image-to-video | Highest capacity | Heavy, slower, harder to control, visually overkill |
+
+## Data Pipeline
+
+The dataset is built from the Universal LPC spritesheet assets. `create_dataset.py` samples compatible body, clothing, hair, accessory, and weapon layers in a fixed order, composites them into full character sheets, then slices each sheet into independent 64-pixel-high animation rows.
+
+![Training data sample](assets/output_samples/training_data_sample.png)
+
+Each training example is:
+
+- Input: frame 0 from a row strip.
+- Conditioning: the animation row label.
+- Target: the remaining frames from the same row.
+
+The generated dataset defaults to 1,000 composited characters: 500 male and 500 female entries. 
+
+## Level 1: TPS / RBF Warp
+
+The lowest-compute baseline moves existing sprite pixels through a hand-authored control-point rig. Thin-plate-spline / RBF deformation is fast and deterministic, which makes it useful as a preview or editor-side tool.
+
+![Warp sample](assets/warp_sample.gif)
+
+Its ceiling is low: large pose changes stretch pixels, break silhouettes, and fail when limbs, weapons, or clothing need newly visible structure. The method is strongest when the input sprite closely matches the assumed rig and motion template.
+
+## Level 2: MSE Transformer Baseline
+
+The first learned model used a patch-based sequence-to-sequence transformer trained with MSE. It learned broad row-level motion structure, but pixel art is especially sensitive to high-frequency detail. MSE rewards averaged futures, so edges, palettes, faces, and weapons became soft.
+
+![MSE inference grid](assets/mse_inference_grid.png)
+
+![MSE loss curve](assets/mse_loss_curve.png)
+
+## Level 3: Restored Transformer
+
+This version uses a BOS-token transformer, row-label conditioning, patch skip connections, perceptual loss, SSIM, and a lightweight patch discriminator.
+
+<p align="center">
+  <img src="assets/output_samples/sample_draw_bow_1.gif" width="140" alt="Generated bow sample" />
+  <img src="assets/output_samples/sample_walk_5.gif" width="140" alt="Generated walk sample 5" />
+</p>
+
+### Model Details
+
+- Frame size: `64 x 64`
+- Patch size: `4 x 4`
+- Patch tokens per frame: `256`
+- Patch dimension: `48`
+- Default model width: `512`
+- Attention heads: `8`
+- Encoder layers: `6`
+- Decoder layers: `6`
+- Feed-forward width: `2048`
+- Max temporal positions: `64`
+- Conditioning: animation row label prepended to encoded frame tokens
+- Generation: target frames are produced from frame 0 and row label
+
+### Training Objective
+
+The restored objective combines reconstruction quality, structure, and adversarial sharpness:
+
+```text
+generator_loss = 0.1 * L1 + 0.1 * VGG perceptual + 0.5 * SSIM + 0.001 * adversarial
+```
+
+The discriminator uses noisy real/fake inputs, one-sided real labels, and starts after a warmup:
+
+- GAN warmup: `5` epochs
+- Discriminator noise: `0.05`
+- Real label smoothing: `0.9`
+- Adversarial weight: `0.001`
+
+### Default Hyperparameters
 
 
-## Introduction
-
-### Main Goal:
-This project will be built around the Python-Rust based 2d GameEngine I'm working on. The goal is to add a animation generation system directly into the Game Editor, allowing developers to create common animations (Running, jumping, attacking .etc) from an idle frame, without drawing each individual frames.
-
-
-
-## The Two Approaches
-
-### The Baseline Warp Approach (Thin Plate Spline)
-
-#### Big Idea:
-
-The first solution is simpler and involves defining a set of "joints" and creating a rig. A motion library is also defined for certain actions, holding the position of the joints in each frame. For each frame, Thin Plate Spline Warp is applied to deform the source sprite's pixels to match the target joint positions, using an RBF solver with TPS kernel: φ(r) = r²·log(r). This kernel minimises the bending energy and makes sure that the warp deforms as little as possible around the joints. 
+| Parameter | Default |
+| --- | --- |
+| Epochs | `250` |
+| Batch size | `128` |
+| Learning rate | `1e-4` |
+| Minimum learning rate | `1e-6` |
+| Optimizer | `AdamW` |
+| Generator weight decay | `1e-4` |
+| Discriminator learning rate | `1e-4` |
+| Discriminator betas | `(0.5, 0.999)` |
+| Curriculum min frames | `2` |
+| Train / validation split | `80 / 20` |
 
 
-#### Measuring Smoothness Around the Joints
+## Wan2.2
 
-The Think plate spline considers the integral of the square of the second derivative. the TPS fits a mapping function to minimize the following energy function:
+The Wan2.2 experiment has a higher theoretical ceiling, but it is much heavier than the transformer method and tends to inherit a high-resolution video prior that is not naturally aligned with tiny pixel sprites.
 
-$E_{tps}(f) = \sum_{i=1}^{k}||y_i - f(x_i)||^2$
-
-#### Limitations:
-
-Due to difference in artstyles and character propotions used by different artists, it is not ideal to assume character propotions. This leaves us wtih two options: joint identification through a framework like MediaPipe and assign joints to sprite, or manually defining a set of joints on the first frame. 
-
-After extensive testing with MediaPipe, it can be concluded that the model is built for realistic images with human propotions, while most pixel-style 2d assets have unrealistic propotions, making it extremely challenging for the model to identify the correct pose. As a result, I've opted to set up a function in the Game Editor UI interface to manually define the joints on the sprite before generating animations, making the movements more realistic. 
+<p align="center">
+  <img src="assets/wan-example.gif" width="220" alt="Wan example 1" />
+  <img src="assets/wan-example2.gif" width="220" alt="Wan example 2" />
+</p>
 
 
+## Running the Project
 
-### The GenAI Approach
+Install the Python dependencies, and clone the LPC Sprite Sheet repo.
 
-For the generative approach, I have yet to settle on a final method, but here's a candidate worth exploring.
+Create the LPC-derived dataset:
 
-#### Image to Sprite Sheet Through Finetuning Stable Diffusion
+```bash
+python create_dataset.py
+```
 
-The idea here is to finetune a latent diffusion model to map a single idle frame to a full animation sprite sheet. **Stable Diffusion** is a well-established open-source latent diffusion model with publicly available weights and a rich ecosystem of finetuning techniques (LoRA, DreamBooth, ControlNet, etc.), making it a practical starting point. The goal would be to condition the model on the input idle frame and have it generate a structurally correct sprite sheet — same character, consistent palette and proportions, across an action sequence laid out in the standard grid format.
+Train the restored transformer:
 
-Finetuning approaches like LoRA are particularly appealing here since they're relatively lightweight and can adapt the model to a specific domain (pixel-art sprite sheets) without requiring massive compute. A ControlNet-style setup could also work well, where the idle frame acts as the conditioning input and the model learns to "fill in" the remaining animation frames.
+```bash
+python train.py
+```
 
-#### Weaknesses of This Approach
+Resume from the old best checkpoint:
 
-- **Training data is limited.** The LPC dataset is clean and structured, but it's a single art style. A model finetuned only on LPC will likely struggle to generalise to characters with very different proportions or aesthetics.
-- **Identity drift across frames.** Getting the model to produce a character that's clearly the same person in frame 1 and frame 8 is harder than it sounds — diffusion models don't have an explicit notion of "this is the same entity." This is probably the biggest challenge.
-- **Grid layout coherence.** Generating a well-structured sprite sheet (correct row/column alignment, consistent frame sizing) is a fairly specific output format that the base model knows nothing about — it all has to be learned from the finetuning data.
-- **Evaluation is tricky.** Metrics like SSIM and LPIPS measure pixel similarity to ground truth, but a generated frame that looks visually correct may still score poorly if it doesn't match the reference pixel-for-pixel. Worth keeping that in mind when interpreting results.
+```bash
+python train.py --resume best_model_old.pt
+```
 
-#### Candidate Models for Sequence Image Generation
+Run inference with the restored default checkpoint:
 
-A few specific models worth considering for this task:
+```bash
+python infer.py --checkpoint best_model_old.pt --num_samples 10
+```
 
-**Stable Video Diffusion (SVD)** — Stability AI's image-to-video model. Takes a single image and generates a short, temporally consistent sequence from it, which maps directly onto the "idle frame → animation frames" problem.
-- Pro: Designed exactly for image-conditioned sequence generation; identity preservation is built into the architecture
-- Con: Produces continuous smooth motion rather than discrete pose frames; not trained on pixel art, so the output style may drift
+Outputs are written to:
 
-
-**CogVideoX** — An open-source video generation model from Zhipu AI, built on a diffusion transformer backbone with strong image-to-video support.
-- Strong open-source video generation with good temporal coherence and image conditioning
-- Much heavier than the SD-based options; harder to finetune on a small domain-specific dataset like LPC
-
-
-## Datasets
-
-### Universal LPC Spritesheet
-
-The primary dataset is the **Universal LPC (Liberated Pixel Cup) Spritesheet**, a community-maintained collection of modular human character sprites in a standardised grid layout. Each sheet follows a fixed format: rows correspond to animation types (walk, run, slash, hurt, etc.) and columns correspond to frames within each cycle. All characters share the same pixel dimensions and joint proportions, making it ideal for supervised learning where the input-output mapping is structurally consistent.
-
-The dataset is particularly well suited for this task because every sheet already pairs a static idle frame (the first frame of the walk-down row) with the full animation grid, providing a natural supervised signal for the image-to-sprite-sheet task without any additional annotation.
-
-### OpenGameArt.org
-
-A broader collection of community-contributed 2d game assets released under open licenses. Unlike the LPC dataset, OpenGameArt spans a wide range of art styles, character proportions, and animation conventions, introducing the style variation needed to prevent the model from overfitting to LPC's specific aesthetic. Sprite sheets are filtered to include only those with clearly segmented animation rows and consistent frame grids.
-
-
-## Evaluation Plan
-
-#### Dataset Split
-
-Evaluation uses the Universal LPC Spritesheet dataset exclusively, as its standardised grid format provides reliable ground-truth frame pairs. The component layers are composited into full character sheets and then split as follows:
-
-Train 90%, Test 10%
-
-
-#### Metrics
-
-**Visual Fidelity** — SSIM and LPIPS are computed between each generated frame and the corresponding ground-truth frame in the test set. These measure pixel-level sharpness and similarity.
-
-**Identity Preservation** — CLIP cosine similarity between the input idle frame and each generated frame checks that the diffusion model has preserved the character's visual style, palette, and proportions across the animation sequence rather than regressing to an average LPC appearance.
-
-
+- `model_output/` for PNG strips and GIF animations.
+- `plot/inference_grid.png` for a static comparison grid.
+- `checkpoints/` for training checkpoints.
